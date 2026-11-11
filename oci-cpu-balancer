@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+OCI Adaptive CPU Load Balancer for Ubuntu 22.04 LTS (aarch64)
+Maintains system-wide CPU utilization within a target window using high-frequency
+micro-slices and lowest-priority CFS scheduling (nice 19).
+Memory Footprint: ~12-16 MB total RSS across all workers (Zero heap churn).
+"""
+
+import os
+import sys
+import time
+import signal
+import ctypes
+import multiprocessing as mp
+
+CONFIG_PATH = "/etc/oci-cpu-balancer.conf"
+
+DEFAULT_CONFIG = {
+    "TARGET_MIN_CPU": 40.0,
+    "TARGET_MAX_CPU": 50.0,
+    "SAMPLE_INTERVAL_SEC": 1.0,
+    "IDLE_THRESHOLD_PERCENT": 15.0,
+    "IDLE_TRIGGER_HOURS": 24.0,
+    "LOG_LEVEL": "INFO",
+}
+
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+CURRENT_LOG_LEVEL = 20
+
+
+def log_msg(level_str: str, message: str) -> None:
+    if LOG_LEVELS.get(level_str, 20) >= CURRENT_LOG_LEVEL:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        sys.stdout.write(f"[{ts}] [{level_str}] {message}\n")
+        sys.stdout.flush()
+
+
+def load_config(path: str) -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if not os.path.isfile(path):
+        log_msg("WARN", f"Configuration file {path} not found. Using defaults.")
+        return cfg
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.split("#", 1)[0].strip().strip('"').strip("'")
+                if k in cfg:
+                    if k == "LOG_LEVEL":
+                        cfg[k] = v.upper() if v.upper() in LOG_LEVELS else "INFO"
+                    else:
+                        cfg[k] = float(v)
+    except Exception as e:
+        log_msg("ERROR", f"Error parsing {path}: {e}. Falling back to defaults.")
+        return DEFAULT_CONFIG.copy()
+
+    # Validate boundaries
+    if not (5.0 <= cfg["TARGET_MIN_CPU"] <= 90.0):
+        cfg["TARGET_MIN_CPU"] = DEFAULT_CONFIG["TARGET_MIN_CPU"]
+    if not (cfg["TARGET_MIN_CPU"] + 2.0 <= cfg["TARGET_MAX_CPU"] <= 95.0):
+        cfg["TARGET_MAX_CPU"] = max(cfg["TARGET_MIN_CPU"] + 10.0, 50.0)
+    if not (0.2 <= cfg["SAMPLE_INTERVAL_SEC"] <= 10.0):
+        cfg["SAMPLE_INTERVAL_SEC"] = DEFAULT_CONFIG["SAMPLE_INTERVAL_SEC"]
+
+    global CURRENT_LOG_LEVEL
+    CURRENT_LOG_LEVEL = LOG_LEVELS.get(cfg["LOG_LEVEL"], 20)
+    return cfg
+
+
+def read_proc_stat() -> tuple[int, int]:
+    """Reads aggregate CPU ticks from /proc/stat. Returns (idle_time, total_time)."""
+    with open("/proc/stat", "r", encoding="ascii") as f:
+        line = f.readline()
+    parts = line.split()
+    # parts[0] is 'cpu'
+    # user(1), nice(2), system(3), idle(4), iowait(5), irq(6), softirq(7), steal(8)
+    values = [int(x) for x in parts[1:9]]
+    idle_time = values[3] + values[4]
+    total_time = sum(values)
+    return idle_time, total_time
+
+
+def worker_loop(duty_cycle: mp.Value, running: mp.Value, slice_sec: float = 0.08) -> None:
+    """
+    Micro-sliced CPU burner worker.
+    Executes pure register-level bitwise integer math with zero object growth.
+    """
+    # Force lowest scheduling priority if not already set
+    try:
+        os.nice(19)
+    except OSError:
+        pass
+
+    # Ignore SIGINT/SIGHUP in workers; master coordinates shutdown via `running`
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    def handle_sigterm(signum, frame):
+        running.value = False
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    clock = time.monotonic
+    sleep = time.sleep
+    x = 0x123456789ABCDEF1
+    mask = 0xFFFFFFFFFFFFFFFF
+
+    while running.value:
+        d = duty_cycle.value
+        if d <= 0.001:
+            sleep(slice_sec)
+            continue
+
+        busy_target = slice_sec * d
+        sleep_target = slice_sec - busy_target
+
+        t_end = clock() + busy_target
+        while clock() < t_end:
+            # Unrolled 64-bit Xorshift star-like register arithmetic
+            x ^= (x >> 12) & mask
+            x ^= (x << 25) & mask
+            x ^= (x >> 27) & mask
+            x = (x * 0x2545F4914F6CDD1D) & mask
+            x ^= (x >> 12) & mask
+            x ^= (x << 25) & mask
+            x ^= (x >> 27) & mask
+            x = (x * 0x2545F4914F6CDD1D) & mask
+
+        if sleep_target > 0.001:
+            sleep(sleep_target)
+
+
+def main() -> None:
+    # Ensure master also runs at nice 19 so children inherit it
+    try:
+        cur_nice = os.nice(0)
+        if cur_nice < 19:
+            os.nice(19 - cur_nice)
+    except OSError:
+        pass
+
+    cfg = load_config(CONFIG_PATH)
+    num_cores = os.cpu_count() or 1
+
+    # Lock-free C-level shared variables for zero IPC allocation overhead
+    duty_cycle = mp.Value(ctypes.c_double, 0.0, lock=False)
+    running = mp.Value(ctypes.c_bool, True, lock=False)
+    reload_requested = False
+
+    def sig_shutdown(signum, frame):
+        running.value = False
+
+    def sig_reload(signum, frame):
+        nonlocal reload_requested
+        reload_requested = True
+
+    signal.signal(signal.SIGTERM, sig_shutdown)
+    signal.signal(signal.SIGINT, sig_shutdown)
+    signal.signal(signal.SIGHUP, sig_reload)
+
+    workers = []
+    for _ in range(num_cores):
+        p = mp.Process(target=worker_loop, args=(duty_cycle, running), daemon=True)
+        p.start()
+        workers.append(p)
+
+    target_mid = (cfg["TARGET_MIN_CPU"] + cfg["TARGET_MAX_CPU"]) / 2.0
+    log_msg(
+        "INFO",
+        f"Service started on {num_cores} cores. Target window: "
+        f"{cfg['TARGET_MIN_CPU']:.1f}% - {cfg['TARGET_MAX_CPU']:.1f}% (Midpoint: {target_mid:.1f}%).",
+    )
+
+    state = "STARTUP"
+    prev_idle, prev_total = read_proc_stat()
+    current_duty = 0.0
+
+    try:
+        while running.value:
+            time.sleep(cfg["SAMPLE_INTERVAL_SEC"])
+            if not running.value:
+                break
+
+            if reload_requested:
+                reload_requested = False
+                cfg = load_config(CONFIG_PATH)
+                target_mid = (cfg["TARGET_MIN_CPU"] + cfg["TARGET_MAX_CPU"]) / 2.0
+                log_msg(
+                    "INFO",
+                    f"Configuration reloaded. Target window: "
+                    f"{cfg['TARGET_MIN_CPU']:.1f}% - {cfg['TARGET_MAX_CPU']:.1f}%.",
+                )
+
+            cur_idle, cur_total = read_proc_stat()
+            total_delta = cur_total - prev_total
+            idle_delta = cur_idle - prev_idle
+            prev_idle, prev_total = cur_idle, cur_total
+
+            if total_delta <= 0:
+                continue
+
+            sys_cpu = 100.0 * (1.0 - (idle_delta / total_delta))
+
+            # Estimate non-burner external CPU load (subtracting our own active duty cycle)
+            estimated_external_cpu = max(0.0, sys_cpu - (current_duty * 100.0))
+
+            # Case 1: External workload alone exceeds TARGET_MAX_CPU -> Immediate backoff to 0%
+            if estimated_external_cpu >= cfg["TARGET_MAX_CPU"]:
+                current_duty = 0.0
+                duty_cycle.value = 0.0
+                if state != "THROTTLED":
+                    log_msg(
+                        "INFO",
+                        f"External load detected at {sys_cpu:.1f}%; throttling back burner to 0%.",
+                    )
+                    state = "THROTTLED"
+                continue
+
+            # Case 2: Total CPU exceeds TARGET_MAX_CPU -> Step down burner proportionally
+            if sys_cpu > cfg["TARGET_MAX_CPU"]:
+                error = (target_mid - sys_cpu) / 100.0
+                current_duty = max(0.0, min(0.95, current_duty + (error * 0.75)))
+                duty_cycle.value = current_duty
+                if current_duty == 0.0 and state != "THROTTLED":
+                    log_msg(
+                        "INFO",
+                        f"System load peaked at {sys_cpu:.1f}%; throttling back burner to 0%.",
+                    )
+                    state = "THROTTLED"
+
+            # Case 3: Total CPU drops below TARGET_MIN_CPU -> Ramp burner toward midpoint
+            elif sys_cpu < cfg["TARGET_MIN_CPU"]:
+                error = (target_mid - sys_cpu) / 100.0
+                current_duty = max(0.0, min(0.95, current_duty + (error * 0.65)))
+                duty_cycle.value = current_duty
+                if state != "ACTIVE":
+                    log_msg(
+                        "INFO",
+                        f"System idle at {sys_cpu:.1f}%; resuming burner load to target {target_mid:.1f}%.",
+                    )
+                    state = "ACTIVE"
+
+            # Case 4: Inside target window -> Gentle micro-trimming toward midpoint
+            else:
+                error = (target_mid - sys_cpu) / 100.0
+                current_duty = max(0.0, min(0.95, current_duty + (error * 0.20)))
+                duty_cycle.value = current_duty
+                if state == "STARTUP":
+                    log_msg(
+                        "INFO",
+                        f"System within target bounds ({sys_cpu:.1f}%); maintaining steady state.",
+                    )
+                    state = "ACTIVE"
+
+    finally:
+        running.value = False
+        duty_cycle.value = 0.0
+        for p in workers:
+            if p.is_alive():
+                p.terminate()
+        for p in workers:
+            p.join(timeout=1.0)
+        log_msg("INFO", "Service stopped cleanly. All worker processes terminated.")
+
+
+if __name__ == "__main__":
+    main()

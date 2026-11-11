@@ -1,0 +1,54 @@
+[Unit]
+Description=OCI Adaptive CPU Load Balancer (Low-Priority CFS Burner)
+Documentation=man:nice(1)
+After=network.target wazuh-manager.service wazuh-indexer.service
+
+[Service]
+Type=simple
+User=ociburner
+Group=ociburner
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+
+ExecStart=/usr/local/bin/oci-cpu-balancer
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Strict Security & Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+# Resource Guardrails (Hard memory cap to protect Wazuh stack)
+MemoryAccounting=yes
+MemoryMax=20M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oci-cpu-balancer
+
+[Install]
+WantedBy=multi-user.target

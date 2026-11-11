@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local test artifacts
+*.log
+idle_tracker.json

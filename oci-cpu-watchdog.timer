@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly Timer for OCI CPU Balancer Idle Watchdog
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=oci-cpu-watchdog.service
+
+[Install]
+WantedBy=timers.target
